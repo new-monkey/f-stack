@@ -21,7 +21,8 @@ all:
 	cc ${CFLAGS} -DINET6 -o ${TARGET} main.c ${LIBS}
 	cc ${CFLAGS} -o ${TARGET}_epoll main_epoll.c ${LIBS}
 	cc ${CFLAGS} -o ${TARGET}_proxy main_proxy.c ${LIBS}
+	cc ${CFLAGS} -o loopback_test loopback_test.c ${LIBS}
 
 .PHONY: clean
 clean:
-	rm -f *.o ${TARGET} ${TARGET}_epoll ${TARGET}_proxy
+	rm -f *.o ${TARGET} ${TARGET}_epoll ${TARGET}_proxy loopback_test
