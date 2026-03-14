@@ -10,6 +10,7 @@
  * - Backend: Connects to 127.0.0.1:8080 (configurable via BACKEND_PORT macro)
  */
 
+#define _GNU_SOURCE  /* For strcasestr */
 #include <stdio.h>
 #include <sys/ioctl.h>
 #include <stdlib.h>
@@ -67,6 +68,9 @@ struct epoll_event events[MAX_EVENTS];
 int epfd;
 int sockfd;
 connection_pair_t connections[MAX_CONNECTIONS];
+
+/* Forward declarations */
+static void handle_client_write(connection_pair_t* conn);
 
 /* Find a free connection slot */
 static connection_pair_t* alloc_connection(void) {
