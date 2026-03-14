@@ -5,6 +5,13 @@
  * that receives requests from network clients and forwards them to a backend
  * HTTP service running on localhost (127.0.0.1).
  *
+ * IMPORTANT: This proxy uses a dual-stack approach:
+ * - Client side: F-Stack APIs (ff_*) for DPDK-based NIC communication
+ * - Backend side: Regular POSIX APIs (socket, connect, read, write) for localhost
+ *
+ * This is necessary because F-Stack/DPDK only handles physical NIC traffic,
+ * not kernel loopback (127.0.0.1). The backend must use kernel sockets.
+ *
  * Configuration:
  * - Frontend: Listens on port 80 (configured via F-Stack)
  * - Backend: Connects to 127.0.0.1:8080 (configurable via BACKEND_PORT macro)
@@ -23,6 +30,8 @@
 #include <errno.h>
 #include <assert.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/epoll.h>
 
 #include "ff_config.h"
 #include "ff_api.h"
@@ -65,7 +74,8 @@ typedef struct connection_pair {
 /* Global state */
 struct epoll_event ev;
 struct epoll_event events[MAX_EVENTS];
-int epfd;
+int epfd;           // F-Stack epoll for client connections
+int kernel_epfd;    // Kernel epoll for backend connections (to localhost)
 int sockfd;
 connection_pair_t connections[MAX_CONNECTIONS];
 
@@ -111,52 +121,58 @@ static connection_pair_t* find_connection_by_backend(int backend_fd) {
 static void free_connection(connection_pair_t* conn) {
     if (conn->client_fd >= 0) {
         ff_epoll_ctl(epfd, EPOLL_CTL_DEL, conn->client_fd, NULL);
-        ff_close(conn->client_fd);
+        ff_close(conn->client_fd);  // F-Stack API for client
         conn->client_fd = -1;
     }
     if (conn->backend_fd >= 0) {
-        ff_epoll_ctl(epfd, EPOLL_CTL_DEL, conn->backend_fd, NULL);
-        ff_close(conn->backend_fd);
+        epoll_ctl(kernel_epfd, EPOLL_CTL_DEL, conn->backend_fd, NULL);  // Kernel epoll
+        close(conn->backend_fd);  // Regular close for backend
         conn->backend_fd = -1;
     }
     conn->active = 0;
     conn->state = CONN_STATE_IDLE;
 }
 
-/* Connect to backend server */
+/* Connect to backend server using regular POSIX sockets (for localhost) */
 static int connect_to_backend(connection_pair_t* conn) {
-    int backend_fd = ff_socket(AF_INET, SOCK_STREAM, 0);
+    /* Use regular socket() instead of ff_socket() for localhost communication */
+    int backend_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (backend_fd < 0) {
         ff_log(FF_LOG_ERR, FF_LOGTYPE_FSTACK_APP, "Failed to create backend socket: %s\n", strerror(errno));
         return -1;
     }
     
-    /* Set non-blocking */
-    int on = 1;
-    ff_ioctl(backend_fd, FIONBIO, &on);
+    /* Set non-blocking using fcntl (not ff_ioctl) */
+    int flags = fcntl(backend_fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(backend_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        ff_log(FF_LOG_ERR, FF_LOGTYPE_FSTACK_APP, "Failed to set non-blocking: %s\n", strerror(errno));
+        close(backend_fd);
+        return -1;
+    }
     
-    /* Connect to backend (127.0.0.1:BACKEND_PORT) */
+    /* Connect to backend (127.0.0.1:BACKEND_PORT) using regular connect() */
     struct sockaddr_in backend_addr;
     bzero(&backend_addr, sizeof(backend_addr));
     backend_addr.sin_family = AF_INET;
     backend_addr.sin_port = htons(BACKEND_PORT);
     inet_pton(AF_INET, "127.0.0.1", &backend_addr.sin_addr);
     
-    int ret = ff_connect(backend_fd, (struct linux_sockaddr *)&backend_addr, sizeof(backend_addr));
+    int ret = connect(backend_fd, (struct sockaddr *)&backend_addr, sizeof(backend_addr));
     if (ret < 0 && errno != EINPROGRESS) {
         ff_log(FF_LOG_ERR, FF_LOGTYPE_FSTACK_APP, "Failed to connect to backend: %s\n", strerror(errno));
-        ff_close(backend_fd);
+        close(backend_fd);
         return -1;
     }
     
     conn->backend_fd = backend_fd;
     
-    /* Add backend socket to epoll for write events (connection complete) and read events */
-    ev.data.fd = backend_fd;
-    ev.events = EPOLLOUT | EPOLLIN | EPOLLERR;
-    if (ff_epoll_ctl(epfd, EPOLL_CTL_ADD, backend_fd, &ev) != 0) {
-        ff_log(FF_LOG_ERR, FF_LOGTYPE_FSTACK_APP, "Failed to add backend to epoll: %s\n", strerror(errno));
-        ff_close(backend_fd);
+    /* Add backend socket to KERNEL epoll (not F-Stack epoll) */
+    struct epoll_event kev;
+    kev.data.fd = backend_fd;
+    kev.events = EPOLLOUT | EPOLLIN | EPOLLERR;
+    if (epoll_ctl(kernel_epfd, EPOLL_CTL_ADD, backend_fd, &kev) != 0) {
+        ff_log(FF_LOG_ERR, FF_LOGTYPE_FSTACK_APP, "Failed to add backend to kernel epoll: %s\n", strerror(errno));
+        close(backend_fd);
         conn->backend_fd = -1;
         return -1;
     }
@@ -292,14 +308,16 @@ static void handle_backend_write(connection_pair_t* conn) {
         /* All request data sent, now wait for response */
         conn->state = CONN_STATE_READING_RESPONSE;
         
-        /* Update epoll to only monitor read events on backend */
-        ev.data.fd = conn->backend_fd;
-        ev.events = EPOLLIN | EPOLLERR;
-        ff_epoll_ctl(epfd, EPOLL_CTL_MOD, conn->backend_fd, &ev);
+        /* Update kernel epoll to only monitor read events on backend */
+        struct epoll_event kev;
+        kev.data.fd = conn->backend_fd;
+        kev.events = EPOLLIN | EPOLLERR;
+        epoll_ctl(kernel_epfd, EPOLL_CTL_MOD, conn->backend_fd, &kev);
         return;
     }
     
-    ssize_t n = ff_write(conn->backend_fd, conn->request_buf + conn->request_sent, remaining);
+    /* Use regular write() for backend (localhost) */
+    ssize_t n = write(conn->backend_fd, conn->request_buf + conn->request_sent, remaining);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             return;  /* Socket not ready yet */
@@ -319,9 +337,10 @@ static void handle_backend_read(connection_pair_t* conn) {
     int space_left = BUFFER_SIZE - conn->response_len;
     if (space_left <= 0) {
         /* Buffer full, disable backend reads until buffer has space */
-        ev.data.fd = conn->backend_fd;
-        ev.events = EPOLLERR;  /* Only monitor errors, stop reading */
-        if (ff_epoll_ctl(epfd, EPOLL_CTL_MOD, conn->backend_fd, &ev) != 0) {
+        struct epoll_event kev;
+        kev.data.fd = conn->backend_fd;
+        kev.events = EPOLLERR;  /* Only monitor errors, stop reading */
+        if (epoll_ctl(kernel_epfd, EPOLL_CTL_MOD, conn->backend_fd, &kev) != 0) {
             ff_log(FF_LOG_ERR, FF_LOGTYPE_FSTACK_APP, "Failed to modify backend epoll: %s\n", strerror(errno));
         }
         /* Try to flush buffer to client */
@@ -329,7 +348,8 @@ static void handle_backend_read(connection_pair_t* conn) {
         return;
     }
     
-    ssize_t n = ff_read(conn->backend_fd, conn->response_buf + conn->response_len, space_left);
+    /* Use regular read() for backend (localhost) */
+    ssize_t n = read(conn->backend_fd, conn->response_buf + conn->response_len, space_left);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             return;  /* No data available yet */
@@ -351,8 +371,8 @@ static void handle_backend_read(connection_pair_t* conn) {
         
         /* Close backend connection */
         if (conn->backend_fd >= 0) {
-            ff_epoll_ctl(epfd, EPOLL_CTL_DEL, conn->backend_fd, NULL);
-            ff_close(conn->backend_fd);
+            epoll_ctl(kernel_epfd, EPOLL_CTL_DEL, conn->backend_fd, NULL);
+            close(conn->backend_fd);
             conn->backend_fd = -1;
         }
         
@@ -407,9 +427,10 @@ static void handle_client_write(connection_pair_t* conn) {
         
         /* Re-enable backend reads now that we have buffer space */
         if (conn->backend_fd >= 0 && conn->state == CONN_STATE_SENDING_RESPONSE) {
-            ev.data.fd = conn->backend_fd;
-            ev.events = EPOLLIN | EPOLLERR;
-            ff_epoll_ctl(epfd, EPOLL_CTL_MOD, conn->backend_fd, &ev);
+            struct epoll_event kev;
+            kev.data.fd = conn->backend_fd;
+            kev.events = EPOLLIN | EPOLLERR;
+            epoll_ctl(kernel_epfd, EPOLL_CTL_MOD, conn->backend_fd, &kev);
         }
     }
     
@@ -437,6 +458,7 @@ static void handle_client_write(connection_pair_t* conn) {
 
 /* Main event loop */
 int loop(void *arg) {
+    /* Poll F-Stack epoll for client events (non-blocking) */
     int nevents = ff_epoll_wait(epfd, events, MAX_EVENTS, 0);
     
     for (int i = 0; i < nevents; i++) {
@@ -448,10 +470,9 @@ int loop(void *arg) {
             continue;
         }
         
-        /* Check if this is a client or backend socket */
+        /* This must be a client socket event (all client sockets are in F-Stack epoll) */
         connection_pair_t* conn = find_connection_by_client(fd);
         if (conn) {
-            /* This is a client socket event */
             if (events[i].events & EPOLLERR) {
                 ff_log(FF_LOG_DEBUG, FF_LOGTYPE_FSTACK_APP, "Client socket error\n");
                 free_connection(conn);
@@ -464,27 +485,35 @@ int loop(void *arg) {
                     handle_client_write(conn);
                 }
             }
-            continue;
+        } else {
+            ff_log(FF_LOG_WARNING, FF_LOGTYPE_FSTACK_APP, "Unknown client fd in event: %d\n", fd);
         }
+    }
+    
+    /* Poll kernel epoll for backend events (non-blocking) */
+    struct epoll_event kevents[MAX_EVENTS];
+    int knevents = epoll_wait(kernel_epfd, kevents, MAX_EVENTS, 0);
+    
+    for (int i = 0; i < knevents; i++) {
+        int fd = kevents[i].data.fd;
         
-        conn = find_connection_by_backend(fd);
+        /* This must be a backend socket event (all backend sockets are in kernel epoll) */
+        connection_pair_t* conn = find_connection_by_backend(fd);
         if (conn) {
-            /* This is a backend socket event */
-            if (events[i].events & EPOLLERR) {
+            if (kevents[i].events & EPOLLERR) {
                 ff_log(FF_LOG_DEBUG, FF_LOGTYPE_FSTACK_APP, "Backend socket error\n");
                 free_connection(conn);
-            } else if (events[i].events & EPOLLOUT) {
+            } else if (kevents[i].events & EPOLLOUT) {
                 handle_backend_write(conn);
-            } else if (events[i].events & EPOLLIN) {
+            } else if (kevents[i].events & EPOLLIN) {
                 if (conn->state == CONN_STATE_READING_RESPONSE || 
                     conn->state == CONN_STATE_SENDING_RESPONSE) {
                     handle_backend_read(conn);
                 }
             }
-            continue;
+        } else {
+            ff_log(FF_LOG_WARNING, FF_LOGTYPE_FSTACK_APP, "Unknown backend fd in event: %d\n", fd);
         }
-        
-        ff_log(FF_LOG_WARNING, FF_LOGTYPE_FSTACK_APP, "Unknown fd in event: %d\n", fd);
     }
     
     return 0;
@@ -532,16 +561,27 @@ int main(int argc, char * argv[]) {
         exit(1);
     }
     
-    /* Create epoll instance */
+    /* Create F-Stack epoll instance for client connections */
     assert((epfd = ff_epoll_create(0)) > 0);
     
-    /* Add listening socket to epoll */
+    /* Create kernel epoll instance for backend connections */
+    kernel_epfd = epoll_create(1);
+    if (kernel_epfd < 0) {
+        ff_log(FF_LOG_ERR, FF_LOGTYPE_FSTACK_APP, "epoll_create failed: %s\n", strerror(errno));
+        exit(1);
+    }
+    
+    /* Add listening socket to F-Stack epoll */
     ev.data.fd = sockfd;
     ev.events = EPOLLIN;
     ff_epoll_ctl(epfd, EPOLL_CTL_ADD, sockfd, &ev);
     
     ff_log(FF_LOG_INFO, FF_LOGTYPE_FSTACK_APP, 
-           "HTTP Reverse Proxy started. Listening on port 80, forwarding to 127.0.0.1:%d\n", 
+           "HTTP Reverse Proxy started (dual-stack mode)\n");
+    ff_log(FF_LOG_INFO, FF_LOGTYPE_FSTACK_APP,
+           "  - Frontend: F-Stack on port 80 (DPDK NIC)\n");
+    ff_log(FF_LOG_INFO, FF_LOGTYPE_FSTACK_APP,
+           "  - Backend: Kernel sockets to 127.0.0.1:%d (localhost)\n", 
            BACKEND_PORT);
     
     /* Run the event loop */
