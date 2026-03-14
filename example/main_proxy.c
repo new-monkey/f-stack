@@ -230,16 +230,35 @@ static void handle_client_read(connection_pair_t* conn) {
     
     /* Check if we have a complete HTTP request (simple check for \r\n\r\n) */
     if (conn->request_len >= 4) {
-        char* end_marker = strstr(conn->request_buf, "\r\n\r\n");
+        /* Use memmem for bounded search since buffer may not be null-terminated */
+        char* end_marker = memmem(conn->request_buf, conn->request_len, "\r\n\r\n", 4);
         if (end_marker) {
             /* We have at least the headers, check for body */
-            char* content_length_str = strcasestr(conn->request_buf, "Content-Length:");
-            int content_length = 0;
-            if (content_length_str) {
-                content_length = atoi(content_length_str + 15);
+            /* Temporarily null-terminate for safe string operations */
+            int headers_len = (end_marker - conn->request_buf) + 4;
+            
+            /* Search for Content-Length header in the headers portion only */
+            char* content_length_str = NULL;
+            for (int i = 0; i < headers_len - 15; i++) {
+                if (strncasecmp(&conn->request_buf[i], "Content-Length:", 15) == 0) {
+                    content_length_str = &conn->request_buf[i];
+                    break;
+                }
             }
             
-            int headers_len = (end_marker - conn->request_buf) + 4;
+            int content_length = 0;
+            if (content_length_str) {
+                /* Parse Content-Length safely using strtol */
+                char* endptr;
+                long len = strtol(content_length_str + 15, &endptr, 10);
+                if (endptr != content_length_str + 15 && len >= 0 && len < BUFFER_SIZE) {
+                    content_length = (int)len;
+                } else {
+                    ff_log(FF_LOG_WARNING, FF_LOGTYPE_FSTACK_APP, "Invalid Content-Length value\n");
+                    content_length = 0;
+                }
+            }
+            
             int total_expected = headers_len + content_length;
             
             if (conn->request_len >= total_expected) {
@@ -299,7 +318,13 @@ static void handle_backend_write(connection_pair_t* conn) {
 static void handle_backend_read(connection_pair_t* conn) {
     int space_left = BUFFER_SIZE - conn->response_len;
     if (space_left <= 0) {
-        /* Buffer full, need to send to client first */
+        /* Buffer full, disable backend reads until buffer has space */
+        ev.data.fd = conn->backend_fd;
+        ev.events = EPOLLERR;  /* Only monitor errors, stop reading */
+        if (ff_epoll_ctl(epfd, EPOLL_CTL_MOD, conn->backend_fd, &ev) != 0) {
+            ff_log(FF_LOG_ERR, FF_LOGTYPE_FSTACK_APP, "Failed to modify backend epoll: %s\n", strerror(errno));
+        }
+        /* Try to flush buffer to client */
         handle_client_write(conn);
         return;
     }
@@ -372,6 +397,21 @@ static void handle_client_write(connection_pair_t* conn) {
     conn->response_sent += n;
     ff_log(FF_LOG_DEBUG, FF_LOGTYPE_FSTACK_APP, "Sent %zd bytes to client (%d/%d)\n", 
            n, conn->response_sent, conn->response_len);
+    
+    /* Compact buffer if we've sent some data but not all */
+    if (conn->response_sent > 0 && conn->response_sent < conn->response_len) {
+        int unsent = conn->response_len - conn->response_sent;
+        memmove(conn->response_buf, conn->response_buf + conn->response_sent, unsent);
+        conn->response_len = unsent;
+        conn->response_sent = 0;
+        
+        /* Re-enable backend reads now that we have buffer space */
+        if (conn->backend_fd >= 0 && conn->state == CONN_STATE_SENDING_RESPONSE) {
+            ev.data.fd = conn->backend_fd;
+            ev.events = EPOLLIN | EPOLLERR;
+            ff_epoll_ctl(epfd, EPOLL_CTL_MOD, conn->backend_fd, &ev);
+        }
+    }
     
     if (conn->response_sent >= conn->response_len) {
         /* All response data sent */

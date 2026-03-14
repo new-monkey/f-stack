@@ -93,7 +93,7 @@ promiscuous=1
 nb_ports=1
 portmask=1
 numa_on=1
-tx_csum_offoad_skip=0
+tx_csum_offload_skip=0
 tso=0
 vlan_strip=1
 
