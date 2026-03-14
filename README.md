@@ -147,6 +147,20 @@ for more details, see [nginx guide](https://github.com/F-Stack/f-stack/blob/mast
     route add -net 0.0.0.0 gw <gateway> dev veth0
     # route add -net ...  # other route rules
 
+## Documentation
+
+F-Stack provides comprehensive documentation in the `doc/` directory:
+
+- **[Quick Start Guide](doc/F-Stack_Quick_Start_Guide.md)** - Get started with F-Stack quickly
+- **[Build Guide](doc/F-Stack_Build_Guide.md)** - Detailed compilation and build instructions
+- **[API Reference](doc/F-Stack_API_Reference.md)** - Complete API documentation
+- **[Development Guide](doc/F-Stack_Development_Guide.md)** - Development guidelines and best practices
+- **[Nginx APP Guide](doc/F-Stack_Nginx_APP_Guide.md)** - Nginx integration guide
+- **[Release Notes](doc/F-Stack_Release_Note.md)** - Version history and changes
+- **[Loopback FAQ](doc/F-Stack_Loopback_FAQ.md)** - Frequently asked questions about loopback interface support (环回接口常见问题)
+
+For more information, visit the [F-Stack Wiki](https://github.com/F-Stack/f-stack/wiki) and [DeepWiki](https://deepwiki.com/F-Stack/f-stack).
+
 ## Nginx Testing Result
 
 Test environment
