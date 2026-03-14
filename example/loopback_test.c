@@ -28,6 +28,8 @@
 
 static volatile int server_ready = 0;
 static volatile int test_passed = 0;
+static pthread_mutex_t ready_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t ready_cond = PTHREAD_COND_INITIALIZER;
 
 /*
  * Server thread - listens on 127.0.0.1:8080
@@ -72,7 +74,12 @@ void* server_thread(void* arg) {
     }
 
     printf("[Server] Listening on 127.0.0.1:%d (F-Stack loopback)\n", SERVER_PORT);
-    server_ready = 1;  // Signal that server is ready
+    
+    // Signal that server is ready
+    pthread_mutex_lock(&ready_mutex);
+    server_ready = 1;
+    pthread_cond_signal(&ready_cond);
+    pthread_mutex_unlock(&ready_mutex);
 
     // Accept connection
     client_len = sizeof(client_addr);
@@ -90,6 +97,7 @@ void* server_thread(void* arg) {
     memset(buffer, 0, BUFFER_SIZE);
     n = ff_read(client_fd, buffer, BUFFER_SIZE - 1);
     if (n > 0) {
+        buffer[n] = '\0';  // Ensure null termination
         printf("[Server] Received %zd bytes: %s\n", n, buffer);
         
         // Verify message
@@ -126,10 +134,14 @@ void* client_thread(void* arg) {
 
     // Wait for server to be ready
     printf("[Client] Waiting for server to start...\n");
+    pthread_mutex_lock(&ready_mutex);
     while (!server_ready) {
-        usleep(100000);  // 100ms
+        pthread_cond_wait(&ready_cond, &ready_mutex);
     }
-    usleep(500000);  // Extra 500ms to ensure server is listening
+    pthread_mutex_unlock(&ready_mutex);
+    
+    // Small delay to ensure server is in accept() call
+    usleep(100000);  // 100ms
 
     printf("[Client] Connecting to 127.0.0.1:%d\n", SERVER_PORT);
 
