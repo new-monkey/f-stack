@@ -1,5 +1,18 @@
 # HTTP反向代理技术方案 (HTTP Reverse Proxy Technical Solution)
 
+## ⚠️ 关键技术问题与解决方案
+
+### 问题：F-Stack 无法直接连接 127.0.0.1
+
+**核心问题：** F-Stack/DPDK 通过内核旁路直接访问物理网卡，**无法访问内核环回接口** (127.0.0.1)。
+
+**解决方案：** 采用**双栈混合架构** (Dual-Stack Hybrid Architecture):
+- **客户端侧**: 使用 F-Stack APIs (`ff_*`) 处理物理网卡流量
+- **后端侧**: 使用 POSIX APIs (`socket`, `connect`, `read`, `write`) 访问 localhost
+- **事件循环**: 维护两个 epoll 实例，分别处理 F-Stack 和内核套接字
+
+这种方案在 DPDK 高性能网络栈和内核 localhost 服务之间建立了桥接。
+
 ## 需求理解 (Requirements Understanding)
 
 根据问题描述，需要在现有 F-Stack examples 的基础上，实现以下功能：
@@ -30,34 +43,35 @@
          ↓
 ┌─────────────────────────────────────────┐
 │  F-Stack Reverse Proxy                  │
-│  (helloworld_proxy)                     │
+│  (helloworld_proxy) - DUAL STACK        │
 │                                         │
-│  Components:                            │
-│  ┌─────────────────────────────────┐   │
-│  │ Client Connection Manager        │   │
-│  │ - Accept from NIC (port 80)     │   │
-│  │ - Parse HTTP requests            │   │
-│  └─────────────────────────────────┘   │
-│            ↓                            │
-│  ┌─────────────────────────────────┐   │
-│  │ Connection Pool                  │   │
-│  │ - Track client-backend pairs    │   │
-│  │ - Manage state machine           │   │
-│  └─────────────────────────────────┘   │
-│            ↓                            │
-│  ┌─────────────────────────────────┐   │
-│  │ Backend Connection Manager       │   │
-│  │ - Connect to 127.0.0.1:8080     │   │
-│  │ - Forward requests               │   │
-│  └─────────────────────────────────┘   │
-│            ↓                            │
-│  ┌─────────────────────────────────┐   │
-│  │ Response Forwarder               │   │
-│  │ - Stream backend responses       │   │
-│  │ - Return to clients              │   │
-│  └─────────────────────────────────┘   │
+│  ┌────────────────────────────────┐    │
+│  │ Client Side (F-Stack)          │    │
+│  │ - ff_socket(), ff_accept()     │    │
+│  │ - ff_read(), ff_write()        │    │
+│  │ - ff_epoll_wait()              │    │
+│  └────────────────────────────────┘    │
+│              ↓                          │
+│  ┌────────────────────────────────┐    │
+│  │ Connection Pool                │    │
+│  │ - client_fd (F-Stack)          │    │
+│  │ - backend_fd (Kernel)          │    │
+│  │ - State machine                │    │
+│  └────────────────────────────────┘    │
+│              ↓                          │
+│  ┌────────────────────────────────┐    │
+│  │ Backend Side (POSIX/Kernel)    │    │
+│  │ - socket(), connect()          │    │
+│  │ - read(), write()              │    │
+│  │ - epoll_wait()                 │    │
+│  └────────────────────────────────┘    │
 └────────┬────────────────────────────────┘
-         │ TCP to localhost
+         │ Kernel socket to localhost
+         ↓
+┌─────────────────────────────────────────┐
+│  Kernel Loopback Interface (lo)        │
+│  - 127.0.0.1                            │
+└────────┬────────────────────────────────┘
          ↓
 ┌─────────────────────────────────────────┐
 │  Backend HTTP Service                   │
@@ -77,7 +91,29 @@
 - epoll 模型更符合 Linux 开发习惯
 - 事件处理逻辑简单易扩展
 
-#### 2.2 核心数据结构 (Core Data Structures)
+#### 2.2 关键技术决策：双栈架构
+
+**为什么需要双栈？**
+
+F-Stack/DPDK 工作原理：
+1. 将网卡从内核驱动解绑
+2. 绑定到 DPDK 用户态驱动 (igb_uio/vfio-pci)
+3. 在用户空间直接访问网卡硬件
+4. 完全绕过内核网络栈
+
+**后果：**
+- ✅ 可以访问：物理网卡收发的数据包
+- ❌ 不能访问：内核管理的网络接口（如 lo、veth 等）
+- ❌ 不能访问：127.0.0.1 (localhost/loopback)
+
+**解决方案：**
+
+| 连接类型 | 使用的 API | epoll 实例 | 原因 |
+|---------|----------|-----------|-----|
+| 客户端连接 | F-Stack APIs (`ff_*`) | `ff_epoll_wait()` | 来自物理网卡，必须用 F-Stack |
+| 后端连接 | POSIX APIs (`socket`, `read`, `write`) | `epoll_wait()` | 访问 localhost，必须用内核 |
+
+#### 2.3 核心数据结构 (Core Data Structures)
 
 ```c
 /* 连接状态 */
@@ -109,58 +145,91 @@ typedef struct connection_pair {
 } connection_pair_t;
 ```
 
-#### 2.3 工作流程 (Workflow)
+#### 2.3 工作流程 (Workflow) - 双栈版本
 
 ```
 1. 初始化阶段:
    - F-Stack 初始化 (ff_init)
-   - 创建监听套接字 (ff_socket)
-   - 绑定到网卡 IP:80 (ff_bind + ff_listen)
-   - 创建 epoll 实例 (ff_epoll_create)
+   - 创建监听套接字 (ff_socket)  ← F-Stack API
+   - 绑定到网卡 IP:80 (ff_bind + ff_listen)  ← F-Stack API
+   - 创建 F-Stack epoll (ff_epoll_create)  ← 客户端用
+   - 创建内核 epoll (epoll_create)  ← 后端用
 
 2. 接收客户端连接:
-   - epoll 检测到监听套接字可读
-   - 调用 ff_accept 接受新连接
+   - ff_epoll_wait 检测监听套接字可读  ← F-Stack epoll
+   - 调用 ff_accept 接受新连接  ← F-Stack API
    - 分配 connection_pair_t 结构
-   - 将客户端 fd 加入 epoll
+   - 将客户端 fd 加入 F-Stack epoll (ff_epoll_ctl)
    - 状态 -> READING_REQUEST
 
 3. 读取 HTTP 请求:
-   - epoll 检测客户端 fd 可读
-   - 调用 ff_read 读取数据到 request_buf
+   - ff_epoll_wait 检测客户端 fd 可读
+   - 调用 ff_read 读取数据到 request_buf  ← F-Stack API
    - 检测完整请求 (查找 \r\n\r\n + Content-Length)
    - 完整后状态 -> CONNECTING_BACKEND
 
-4. 连接后端服务:
-   - 创建新套接字 ff_socket
-   - 连接到 127.0.0.1:8080 (ff_connect)
-   - 将后端 fd 加入 epoll
+4. 连接后端服务 (关键变化！):
+   - 创建新套接字 socket()  ← 内核 API！
+   - 设置非阻塞 fcntl(O_NONBLOCK)  ← 内核 API！
+   - 连接到 127.0.0.1:8080 (connect)  ← 内核 API！
+   - 将后端 fd 加入内核 epoll (epoll_ctl)  ← 内核 epoll！
    - 状态 -> SENDING_REQUEST
 
 5. 转发请求:
-   - epoll 检测后端 fd 可写
-   - 调用 ff_write 发送 request_buf
+   - epoll_wait 检测后端 fd 可写  ← 内核 epoll！
+   - 调用 write() 发送 request_buf  ← 内核 API！
    - 全部发送后状态 -> READING_RESPONSE
 
 6. 读取后端响应:
-   - epoll 检测后端 fd 可读
-   - 调用 ff_read 读取到 response_buf
+   - epoll_wait 检测后端 fd 可读  ← 内核 epoll！
+   - 调用 read() 读取到 response_buf  ← 内核 API！
    - 状态 -> SENDING_RESPONSE
    - 立即尝试发送到客户端
 
 7. 转发响应:
-   - 调用 ff_write 发送 response_buf 到客户端
+   - 调用 ff_write 发送 response_buf 到客户端  ← F-Stack API！
    - 全部发送后:
      * 如果 Keep-Alive: 重置缓冲区，状态 -> READING_REQUEST
      * 如果 Connection: close: 关闭连接
 
 8. 错误处理:
    - 任何套接字错误都会关闭整个连接对
-   - 超时检测（可选实现）
+   - 客户端: ff_close() + ff_epoll_ctl(DEL)
+   - 后端: close() + epoll_ctl(DEL)
    - 资源清理
+
+9. 事件循环 (双epoll):
+   loop() {
+       // 1. 轮询 F-Stack epoll (客户端事件)
+       ff_epoll_wait(epfd, events, ...);
+       处理客户端读写事件;
+       
+       // 2. 轮询内核 epoll (后端事件)
+       epoll_wait(kernel_epfd, kevents, ...);
+       处理后端读写事件;
+   }
 ```
 
 #### 2.4 关键技术点 (Key Technical Points)
+
+**a) 双栈 API 映射表**
+
+| 操作 | 客户端 (F-Stack) | 后端 (Kernel) |
+|------|-----------------|--------------|
+| 创建套接字 | `ff_socket()` | `socket()` |
+| 绑定地址 | `ff_bind()` | `bind()` |
+| 监听 | `ff_listen()` | `listen()` |
+| 接受连接 | `ff_accept()` | `accept()` |
+| 连接 | `ff_connect()` | `connect()` |
+| 读数据 | `ff_read()` | `read()` |
+| 写数据 | `ff_write()` | `write()` |
+| 关闭 | `ff_close()` | `close()` |
+| 设置非阻塞 | `ff_ioctl(FIONBIO)` | `fcntl(O_NONBLOCK)` |
+| 创建 epoll | `ff_epoll_create()` | `epoll_create()` |
+| epoll 控制 | `ff_epoll_ctl()` | `epoll_ctl()` |
+| epoll 等待 | `ff_epoll_wait()` | `epoll_wait()` |
+
+**b) 连接对管理**
 
 **a) 非阻塞 I/O**
 ```c

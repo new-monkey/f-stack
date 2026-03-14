@@ -1,5 +1,20 @@
 # F-Stack HTTP Reverse Proxy Example
 
+## ⚠️ 重要说明 (IMPORTANT NOTE)
+
+**双栈架构 (Dual-Stack Architecture):**
+
+本代理使用混合网络栈实现，因为 F-Stack/DPDK 只能处理物理网卡流量，无法访问内核环回接口（127.0.0.1）：
+
+This proxy uses a hybrid network stack because F-Stack/DPDK can only handle physical NIC traffic and cannot access the kernel loopback interface (127.0.0.1):
+
+- **客户端连接 (Client Side)**: F-Stack APIs (`ff_*`) - DPDK 内核旁路
+- **后端连接 (Backend Side)**: POSIX APIs (`socket`, `connect`, `read`, `write`) - 内核套接字
+
+这种设计在 DPDK 网卡和本地服务之间建立了桥接。
+
+This design creates a bridge between DPDK NIC and localhost services.
+
 ## 概述 (Overview)
 
 这个示例演示了如何使用 F-Stack 构建一个高性能的 HTTP 反向代理。程序从网卡接收 HTTP 请求，然后作为代理将请求转发到本地运行的真实 HTTP 服务（监听在 127.0.0.1），并将响应返回给客户端。
@@ -11,26 +26,34 @@ This example demonstrates how to build a high-performance HTTP reverse proxy usi
 ```
 Internet Client
       ↓
-  [Network Card]
+[Physical NIC - DPDK Managed]
       ↓
-  F-Stack Proxy (port 80)
-  - Receives packets via DPDK
-  - Parses HTTP requests
+F-Stack Proxy (port 80)
+├─ Client Side: F-Stack APIs (ff_*)
+├─ Dual Epoll: ff_epoll + kernel epoll
+└─ Backend Side: POSIX APIs (socket, read, write)
       ↓
-  Backend Server (127.0.0.1:8080)
-  - Real HTTP service
-  - Generates responses
+[Kernel Loopback - 127.0.0.1]
       ↓
-  F-Stack Proxy
-  - Forwards response
+Backend Server (127.0.0.1:8080)
+- Real HTTP service
+- Generates responses
       ↓
-  Internet Client
+[Kernel Loopback]
+      ↓
+F-Stack Proxy
+      ↓
+[Physical NIC - DPDK]
+      ↓
+Internet Client
 ```
 
 ## 主要特性 (Key Features)
 
 - **零拷贝网络栈**: 使用 F-Stack/DPDK 实现内核旁路，获得超高网络性能
-- **事件驱动架构**: 使用 epoll 实现高效的事件处理
+- **双栈架构**: F-Stack (NIC) + POSIX (localhost) 混合方案
+- **双 epoll 事件循环**: 分别处理客户端和后端事件
+- **事件驱动架构**: 高效的 epoll 事件处理
 - **全双工转发**: 同时处理客户端到后端和后端到客户端的数据流
 - **连接池管理**: 高效管理客户端-后端连接对
 - **Keep-Alive 支持**: 支持 HTTP 持久连接
@@ -214,6 +237,66 @@ typedef struct connection_pair {
 ```ini
 [log]
 level=DEBUG  # 可选: ERR, WARNING, INFO, DEBUG
+```
+
+## 常见问题 (FAQ)
+
+### Q: 为什么需要双栈架构？(Why dual-stack architecture?)
+
+**A:** F-Stack/DPDK 通过绕过内核直接访问物理网卡实现高性能，但这意味着它**无法访问内核的环回接口** (127.0.0.1/localhost)。环回接口是一个虚拟的内核网络接口，不经过物理网卡。
+
+F-Stack/DPDK achieves high performance by bypassing the kernel and accessing physical NICs directly, but this means it **cannot access the kernel's loopback interface** (127.0.0.1/localhost). The loopback interface is a virtual kernel network interface that doesn't go through physical NICs.
+
+因此：
+- ❌ 不能用 `ff_connect()` 连接到 127.0.0.1
+- ❌ 不能用 `ff_read()`/`ff_write()` 与 localhost 服务通信
+- ✅ 必须使用常规 POSIX socket API 连接本地服务
+
+Therefore:
+- ❌ Cannot use `ff_connect()` to connect to 127.0.0.1
+- ❌ Cannot use `ff_read()`/`ff_write()` to communicate with localhost services
+- ✅ Must use regular POSIX socket APIs to connect to local services
+
+### Q: 性能会受影响吗？(Performance impact?)
+
+**A:** 影响很小。客户端连接仍然使用 F-Stack/DPDK 的零拷贝高性能路径。只有到后端 localhost 的连接使用内核套接字，这通常不是性能瓶颈，因为：
+
+The impact is minimal. Client connections still use F-Stack/DPDK's zero-copy high-performance path. Only the backend localhost connections use kernel sockets, which is typically not a performance bottleneck because:
+
+1. 环回接口本身就非常快（内存复制，无网卡开销）
+2. 通常后端处理才是瓶颈，而非网络 I/O
+3. 客户端到代理的路径（高并发部分）仍然是 DPDK 加速的
+
+1. Loopback interface is already very fast (memory copy, no NIC overhead)
+2. Backend processing is usually the bottleneck, not network I/O
+3. Client-to-proxy path (high concurrency part) is still DPDK accelerated
+
+### Q: 可以让后端也使用 F-Stack 吗？(Can backend also use F-Stack?)
+
+**A:** 可以，但需要后端服务也改为使用 F-Stack，并监听在 F-Stack 管理的 IP 地址（而非 127.0.0.1）。这种情况下：
+
+Yes, but the backend service would need to be modified to use F-Stack too, and listen on an F-Stack managed IP address (not 127.0.0.1). In this case:
+
+- 后端必须重写为使用 F-Stack APIs
+- 后端需要监听在 F-Stack 配置的 IP 上
+- 可以使用 `ff_connect()` 连接到 F-Stack 管理的 IP
+- 适合 F-Stack 到 F-Stack 的通信场景
+
+- Backend must be rewritten to use F-Stack APIs
+- Backend needs to listen on F-Stack configured IP
+- Can use `ff_connect()` to connect to F-Stack managed IP
+- Suitable for F-Stack-to-F-Stack communication scenarios
+
+### Q: 如何验证双栈架构是否工作？(How to verify dual-stack is working?)
+
+**A:** 查看启动日志，应该看到：
+
+Check the startup logs, you should see:
+
+```
+HTTP Reverse Proxy started (dual-stack mode)
+  - Frontend: F-Stack on port 80 (DPDK NIC)
+  - Backend: Kernel sockets to 127.0.0.1:8080 (localhost)
 ```
 
 ## 已知限制 (Known Limitations)
