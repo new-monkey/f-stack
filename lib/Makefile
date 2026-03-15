@@ -15,7 +15,7 @@ C=${TOPDIR}/freebsd/contrib/ck/include
 MACHINE_INCLUDES_ROOT:=${CURDIR}/machine_include
 OVERRIDE_INCLUDES_ROOT:=${CURDIR}/include
 X86_INCLUDES=0
-PREFIX?=/usr/local
+PREFIX?=/compiletool/pkgs/fstack
 PREFIX_LIB=${PREFIX}/lib
 PREFIX_INCLUDE=${PREFIX}/include
 PREFIX_BIN=${PREFIX}/bin
@@ -28,7 +28,7 @@ endif
 
 HOST_OS:=$(shell uname -s)
 
-#DEBUG=-O0 -gdwarf-2 -g3 -Wno-format-truncation
+DEBUG=-O0 -gdwarf-2 -g3 -Wno-format-truncation
 
 # No DPDK KNI support on FreeBSD
 # Enable KNI, via viritio only, no longer support rte_kni.ko.
