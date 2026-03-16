@@ -16,6 +16,14 @@
 
 class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
 public:
+	struct Stats {
+		std::size_t bytesRead = 0;
+		std::size_t bytesWritten = 0;
+		std::size_t framesDispatched = 0;
+		std::size_t droppedBytes = 0;
+		std::size_t protocolErrors = 0;
+	};
+
 	enum class State {
 		kConnecting,
 		kConnected,
@@ -42,7 +50,7 @@ public:
 		OverflowPolicy overflowPolicy = OverflowPolicy::kDropNewData;
 	};
 
-	using CloseCallback = std::function<void(int)>;
+	using CloseCallback = std::function<void(const TcpConnection&)>;
 
 	TcpConnection(int fd, IoOps ioOps, MessageDispatcher* dispatcher)
 		: TcpConnection(fd, std::move(ioOps), dispatcher, Options()) {}
@@ -54,8 +62,14 @@ public:
 		  options_(options),
 		  state_(State::kConnecting),
 		  interestedEvents_(0),
-		  droppedBytes_(0),
-		  protocolErrorCount_(0) {}
+		  closeNotified_(false) {}
+
+	~TcpConnection() {
+		if (fd_ >= 0) {
+			(void)ioOps_.closeFn(fd_);
+			fd_ = -1;
+		}
+	}
 
 	int fd() const { return fd_; }
 
@@ -63,9 +77,17 @@ public:
 
 	uint32_t interestedEvents() const { return interestedEvents_; }
 
-	std::size_t droppedBytes() const { return droppedBytes_; }
+	std::size_t droppedBytes() const { return stats_.droppedBytes; }
 
-	std::size_t protocolErrorCount() const { return protocolErrorCount_; }
+	std::size_t protocolErrorCount() const { return stats_.protocolErrors; }
+
+	std::size_t bytesRead() const { return stats_.bytesRead; }
+
+	std::size_t bytesWritten() const { return stats_.bytesWritten; }
+
+	std::size_t framesDispatched() const { return stats_.framesDispatched; }
+
+	const Stats& stats() const { return stats_; }
 
 	void setCloseCallback(CloseCallback cb) { closeCallback_ = std::move(cb); }
 
@@ -86,6 +108,7 @@ public:
 		if (outputBuffer_.readableBytes() == 0) {
 			const ssize_t n = ioOps_.writeFn(fd_, data.data(), data.size());
 			if (n >= 0) {
+				stats_.bytesWritten += static_cast<std::size_t>(n);
 				if (static_cast<std::size_t>(n) == data.size()) {
 					disableWriteEvent();
 					return true;
@@ -113,6 +136,7 @@ public:
 			char tmp[8192];
 			const ssize_t n = ioOps_.readFn(fd_, tmp, sizeof(tmp));
 			if (n > 0) {
+				stats_.bytesRead += static_cast<std::size_t>(n);
 				inputBuffer_.append(tmp, static_cast<std::size_t>(n));
 				continue;
 			}
@@ -147,6 +171,7 @@ public:
 			const std::string_view chunk = outputBuffer_.peekAsView(outputBuffer_.readableBytes());
 			const ssize_t n = ioOps_.writeFn(fd_, chunk.data(), chunk.size());
 			if (n > 0) {
+				stats_.bytesWritten += static_cast<std::size_t>(n);
 				outputBuffer_.retrieve(static_cast<std::size_t>(n));
 				continue;
 			}
@@ -168,15 +193,16 @@ public:
 
 		state_ = State::kDisconnected;
 		interestedEvents_ = 0;
-		(void)ioOps_.closeFn(fd_);
 
-		if (closeCallback_) {
-			closeCallback_(fd_);
+		if (!closeNotified_ && closeCallback_) {
+			closeNotified_ = true;
+			closeCallback_(*this);
 		}
 	}
 
 private:
 	static constexpr std::size_t kHeaderLen = 8;
+	static constexpr std::size_t kFrameHeaderLen = 4;
 
 	bool appendToOutputBuffer(std::string_view data) {
 		if (data.empty()) {
@@ -184,7 +210,7 @@ private:
 		}
 
 		if (options_.maxOutputBufferBytes == 0) {
-			droppedBytes_ += data.size();
+			stats_.droppedBytes += data.size();
 			return false;
 		}
 
@@ -195,7 +221,7 @@ private:
 		}
 
 		const std::size_t overflow = outputBuffer_.readableBytes() + data.size() - options_.maxOutputBufferBytes;
-		droppedBytes_ += overflow;
+		stats_.droppedBytes += overflow;
 
 		if (options_.overflowPolicy == OverflowPolicy::kDropNewData) {
 			const std::size_t canKeep = options_.maxOutputBufferBytes > outputBuffer_.readableBytes()
@@ -226,6 +252,9 @@ private:
 		return false;
 	}
 
+	// [PayloadLen:4B][MsgCode:4B][PayloadBody:payloadLenB-4B]
+	// PayloadLen = sizeof(MsgCode) + sizeof(PayloadBody)
+	// Dispatcher payload view = [MsgCode|PayloadBody] (length=PayloadLen)
 	void parseFrames() {
 		while (inputBuffer_.readableBytes() >= kHeaderLen) {
 			const std::string_view header = inputBuffer_.peekAsView(kHeaderLen);
@@ -238,23 +267,24 @@ private:
 			const uint32_t payloadLen = ntohl(netLen);
 			const uint32_t msgCode = ntohl(netCode);
 
-			if (payloadLen > options_.maxPayloadBytes) {
-				++protocolErrorCount_;
-				inputBuffer_.retrieve(kHeaderLen);
+			if (payloadLen < sizeof(uint32_t) || payloadLen > options_.maxPayloadBytes) {
+				++stats_.protocolErrors;
+				inputBuffer_.retrieve(kFrameHeaderLen);
 				continue;
 			}
 
-			const std::size_t frameLen = kHeaderLen + static_cast<std::size_t>(payloadLen);
+			const std::size_t frameLen = kFrameHeaderLen + static_cast<std::size_t>(payloadLen);
 			if (inputBuffer_.readableBytes() < frameLen) {
 				return;
 			}
 
-			inputBuffer_.retrieve(kHeaderLen);
-			const std::string_view payload = inputBuffer_.peekAsView(payloadLen);
+			const std::string_view frame = inputBuffer_.peekAsView(frameLen);
+			const std::string_view payload(frame.data() + kFrameHeaderLen, payloadLen);
 			if (dispatcher_ != nullptr) {
 				dispatcher_->dispatch(msgCode, payload, shared_from_this());
 			}
-			inputBuffer_.retrieve(payloadLen);
+			++stats_.framesDispatched;
+			inputBuffer_.retrieve(frameLen);
 		}
 	}
 
@@ -277,7 +307,7 @@ private:
 	uint32_t interestedEvents_;
 	Buffer inputBuffer_;
 	Buffer outputBuffer_;
-	std::size_t droppedBytes_;
-	std::size_t protocolErrorCount_;
+	Stats stats_;
+	bool closeNotified_;
 	CloseCallback closeCallback_;
 };

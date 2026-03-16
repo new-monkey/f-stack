@@ -20,6 +20,17 @@
 
 class EventLoop {
 public:
+	struct Stats {
+		std::size_t totalAccepted = 0;
+		std::size_t totalClosed = 0;
+		std::size_t activeConnections = 0;
+		std::size_t totalBytesRead = 0;
+		std::size_t totalBytesWritten = 0;
+		std::size_t totalFramesDispatched = 0;
+		std::size_t totalDroppedBytes = 0;
+		std::size_t totalProtocolErrors = 0;
+	};
+
 	struct Options {
 		std::size_t maxEvents = 1024;
 		std::size_t maxPayloadBytes = 40960;
@@ -42,6 +53,8 @@ public:
 
 	MessageDispatcher& dispatcher() { return dispatcher_; }
 
+	const Stats& stats() const { return stats_; }
+
 	void queueInLoop(std::function<void()> fn) {
 		if (fn) {
 			pendingFunctors_.push_back(std::move(fn));
@@ -52,7 +65,7 @@ public:
 
 	bool addConnection(int fd) {
 		auto conn = std::make_shared<TcpConnection>(fd, buildIoOps(), &dispatcher_, buildConnOptions());
-		conn->setCloseCallback([this](int closedFd) { connections_.erase(closedFd); });
+		conn->setCloseCallback([this](const TcpConnection& connRef) { onConnectionClosed(connRef); });
 		conn->markConnected();
 
 		if (!epoller_.add(fd, conn->interestedEvents(), conn.get())) {
@@ -60,17 +73,18 @@ public:
 		}
 
 		connections_[fd] = std::move(conn);
+		++stats_.totalAccepted;
+		stats_.activeConnections = connections_.size();
 		return true;
 	}
 
 	void removeConnection(int fd) {
-		(void)epoller_.del(fd);
 		const auto it = connections_.find(fd);
 		if (it == connections_.end()) {
 			return;
 		}
+		(void)epoller_.del(fd);
 		it->second->shutdown();
-		connections_.erase(it);
 	}
 
 	int loopOnce(int timeoutMs) {
@@ -94,8 +108,8 @@ public:
 
 			const auto conn = mapIt->second;
 			if (ev.events & static_cast<uint32_t>(EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-				conn->shutdown();
 				(void)epoller_.del(fd);
+				conn->shutdown();
 				continue;
 			}
 
@@ -184,6 +198,17 @@ private:
 		return connOptions;
 	}
 
+	void onConnectionClosed(const TcpConnection& conn) {
+		stats_.totalClosed += 1;
+		stats_.totalBytesRead += conn.bytesRead();
+		stats_.totalBytesWritten += conn.bytesWritten();
+		stats_.totalFramesDispatched += conn.framesDispatched();
+		stats_.totalDroppedBytes += conn.droppedBytes();
+		stats_.totalProtocolErrors += conn.protocolErrorCount();
+		connections_.erase(conn.fd());
+		stats_.activeConnections = connections_.size();
+	}
+
 	void doPendingFunctors() {
 		if (pendingFunctors_.empty()) {
 			return;
@@ -205,5 +230,6 @@ private:
 	MessageDispatcher dispatcher_;
 	std::unordered_map<int, std::shared_ptr<TcpConnection>> connections_;
 	std::deque<std::function<void()>> pendingFunctors_;
+	Stats stats_;
 	bool running_;
 };

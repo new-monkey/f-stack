@@ -4,10 +4,8 @@
 #include <iostream>
 #include <string>
 #include <string_view>
-#include <unistd.h>
 
-#include "Acceptor.h"
-#include "EventLoop.h"
+#include "ReactorServer.h"
 
 namespace {
 
@@ -47,41 +45,37 @@ int main(int argc, char** argv) {
     options.maxOutputBufferBytes = 1U << 20;
     options.overflowPolicy = TcpConnection::OverflowPolicy::kDropNewData;
 
-    EventLoop loop(EpollBackendType::kKernel, options);
-    if (!loop.init()) {
-        std::perror("EventLoop::init");
+    ReactorServer server(EpollBackendType::kKernel, options);
+    if (!server.init("0.0.0.0", port, 1024)) {
+        std::perror("ReactorServer::init");
         return 1;
     }
 
-    Acceptor acceptor(EpollBackendType::kKernel);
-    if (!acceptor.open("0.0.0.0", port, 1024)) {
-        std::perror("Acceptor::open");
-        return 1;
-    }
-
-    acceptor.setNewConnectionCallback([&loop](int clientFd) {
-        if (!loop.addConnection(clientFd)) {
-            std::perror("loop.addConnection");
-            (void)::close(clientFd);
-        }
-    });
-
-    loop.dispatcher().registerHandler(1, [](uint32_t code, std::string_view payload, const std::shared_ptr<TcpConnection>& conn) {
+    server.dispatcher().registerHandler(1, [](uint32_t code, std::string_view payload, const std::shared_ptr<TcpConnection>& conn) {
         const std::string frame = encodeFrame(code, payload);
         (void)conn->send(frame);
     });
 
-    loop.dispatcher().setDefaultHandler([](uint32_t code, std::string_view, const std::shared_ptr<TcpConnection>&) {
+    server.dispatcher().setDefaultHandler([](uint32_t code, std::string_view, const std::shared_ptr<TcpConnection>&) {
         std::cerr << "unknown MsgCode: " << code << std::endl;
     });
 
     std::cout << "dev kernel echo server listening on 0.0.0.0:" << port << std::endl;
 
     while (!g_stop) {
-        acceptor.acceptReady();
-
-        (void)loop.loopOnce(50);
+        server.serveOnce(50);
     }
+
+    const auto& stats = server.stats();
+    std::cout << "server stats: accepted=" << stats.totalAccepted
+              << ", closed=" << stats.totalClosed
+              << ", active=" << stats.activeConnections
+              << ", bytes_read=" << stats.totalBytesRead
+              << ", bytes_written=" << stats.totalBytesWritten
+              << ", frames=" << stats.totalFramesDispatched
+              << ", dropped=" << stats.totalDroppedBytes
+              << ", protocol_errors=" << stats.totalProtocolErrors
+              << std::endl;
 
     return 0;
 }

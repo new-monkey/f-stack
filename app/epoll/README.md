@@ -5,6 +5,12 @@
 - Kernel 后端：使用 `epoll_*` + `read/write`，用于开发阶段替代测试。
 - F-Stack 后端：使用 `ff_epoll_*` + `ff_read/ff_write`，用于最终集成。
 
+核心组合关系：
+
+- `ReactorServer` 组合 `Acceptor + EventLoop`
+- `EventLoop` 管理 `TcpConnection + MessageDispatcher`
+- `TcpConnection` 持有输入输出 `Buffer`
+
 ## 后端切换
 
 通过 `EpollBackendType` 在运行期选择后端：
@@ -23,6 +29,7 @@
 
 - 使用 `Acceptor` 组件负责 listen/accept 与非阻塞设置。
 - 使用 `EventLoop` + `TcpConnection` 处理读写与消息分发。
+- 新版本可直接通过 `ReactorServer` 启动，业务层只需要注册 dispatcher handler。
 
 编译：
 
@@ -50,6 +57,28 @@ g++ -std=c++17 -I/root/f-stack -I/root/f-stack/lib app/epoll/dev_kernel_echo_ser
 - 事件模型：LT（水平触发）
 - outputBuffer 溢出策略：默认丢弃新数据（可在 `EventLoop::Options` 中改）
 - 单线程 Reactor
+- 连接关闭语义：先从 EventLoop/Epoll 索引中摘除，连接对象析构时再最终 close fd
+
+## 观测能力
+
+`TcpConnection` 当前提供：
+
+- `bytesRead`
+- `bytesWritten`
+- `framesDispatched`
+- `droppedBytes`
+- `protocolErrorCount`
+
+`EventLoop` 当前聚合提供：
+
+- `totalAccepted`
+- `totalClosed`
+- `activeConnections`
+- `totalBytesRead`
+- `totalBytesWritten`
+- `totalFramesDispatched`
+- `totalDroppedBytes`
+- `totalProtocolErrors`
 
 ## 开发期策略测试
 
