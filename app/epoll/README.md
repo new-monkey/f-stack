@@ -30,6 +30,8 @@
 
 示例文件：`dev_kernel_echo_server.cpp`
 
+交互式测试客户端：`dev_echo_client.py`
+
 - 使用 `Acceptor` 组件负责 listen/accept 与非阻塞设置。
 - 使用 `EventLoop` + `TcpConnection` 处理读写与消息分发。
 - 新版本可直接通过 `ReactorServer` 启动，业务层只需要注册 dispatcher handler。
@@ -44,6 +46,7 @@ g++ -std=c++17 -I/root/f-stack -I/root/f-stack/lib app/epoll/dev_kernel_echo_ser
 
 ```bash
 /tmp/dev_kernel_echo_server 19090
+python3 app/epoll/dev_echo_client.py 127.0.0.1 19090
 ```
 
 协议格式：
@@ -69,6 +72,13 @@ g++ -std=c++17 -I/root/f-stack -I/root/f-stack/lib app/epoll/dev_kernel_echo_ser
 默认注册：
 
 - `MsgCode == 1`：回显 payload。
+
+交互式客户端命令：
+
+- `/code <num>`：切换当前发送的 `MsgCode`
+- `/hex <hexstr>`：按十六进制发送 body
+- `/quit`：退出
+- 其他输入：按 UTF-8 文本作为 body 发送
 
 ## ReactorServer HTML 变体与专用客户端
 
