@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "FrameCodec.h"
 #include "MessageDispatcher.h"
 #include "TcpConnection.h"
 
@@ -97,15 +98,9 @@ void testDispatcherPayloadIncludesMsgCode() {
 
     const uint32_t msgCode = 1001;
     const std::string body = "hello";
-    const uint32_t payloadLenHost = static_cast<uint32_t>(sizeof(uint32_t) + body.size());
-    const uint32_t netLen = htonl(payloadLenHost);
+    const uint32_t payloadLenHost = static_cast<uint32_t>(FrameCodec::kMsgCodeSize + body.size());
     const uint32_t netCode = htonl(msgCode);
-
-    std::string frame;
-    frame.resize(sizeof(netLen) + sizeof(netCode) + body.size());
-    std::memcpy(frame.data(), &netLen, sizeof(netLen));
-    std::memcpy(frame.data() + sizeof(netLen), &netCode, sizeof(netCode));
-    std::memcpy(frame.data() + sizeof(netLen) + sizeof(netCode), body.data(), body.size());
+    const std::string frame = FrameCodec::encode(msgCode, body);
 
     const ssize_t wn = ::write(fds[1], frame.data(), frame.size());
     assert(wn == static_cast<ssize_t>(frame.size()));

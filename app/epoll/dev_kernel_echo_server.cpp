@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 
+#include "FrameCodec.h"
 #include "ReactorServer.h"
 
 namespace {
@@ -13,20 +14,6 @@ volatile sig_atomic_t g_stop = 0;
 
 void onSignal(int) {
     g_stop = 1;
-}
-
-std::string encodeFrame(uint32_t code, std::string_view payload) {
-    std::string frame;
-    frame.resize(8 + payload.size());
-
-    const uint32_t netLen = htonl(static_cast<uint32_t>(payload.size()));
-    const uint32_t netCode = htonl(code);
-    std::memcpy(&frame[0], &netLen, sizeof(netLen));
-    std::memcpy(&frame[4], &netCode, sizeof(netCode));
-    if (!payload.empty()) {
-        std::memcpy(&frame[8], payload.data(), payload.size());
-    }
-    return frame;
 }
 
 }  // namespace
@@ -52,7 +39,19 @@ int main(int argc, char** argv) {
     }
 
     server.dispatcher().registerHandler(1, [](uint32_t code, std::string_view payload, const std::shared_ptr<TcpConnection>& conn) {
-        const std::string frame = encodeFrame(code, payload);
+        uint32_t payloadCode = 0;
+        if (!FrameCodec::extractMsgCode(payload, payloadCode)) {
+            std::cerr << "invalid payload: too short" << std::endl;
+            return;
+        }
+        if (payloadCode != code) {
+            std::cerr << "invalid payload: code mismatch" << std::endl;
+            return;
+        }
+
+        const std::string_view body = FrameCodec::bodyFromPayload(payload);
+        const std::string frame = FrameCodec::encode(payload);
+        std::cout << "recv from fd " << conn->fd() << ": code=" << code << ", body=" << body << std::endl;
         (void)conn->send(frame);
     });
 

@@ -11,21 +11,21 @@ class TcpConnection;
 class MessageDispatcher {
 public:
 	using ConnectionPtr = std::shared_ptr<TcpConnection>;
-	using Callback = std::function<void(uint32_t code, std::string_view payload, const ConnectionPtr& conn)>;
+	using Callback = std::function<void(uint32_t code, std::string_view framePayload, const ConnectionPtr& conn)>;
 
 	void registerHandler(uint32_t code, Callback cb) { handlers_[code] = std::move(cb); }
 
 	void setDefaultHandler(Callback cb) { defaultHandler_ = std::move(cb); }
 
-	bool dispatch(uint32_t code, std::string_view payload, const ConnectionPtr& conn) const {
+	bool dispatch(uint32_t code, std::string_view framePayload, const ConnectionPtr& conn) const {
 		const auto it = handlers_.find(code);
 		if (it != handlers_.end()) {
-			it->second(code, payload, conn);
+			it->second(code, framePayload, conn);
 			return true;
 		}
 
 		if (defaultHandler_) {
-			defaultHandler_(code, payload, conn);
+			defaultHandler_(code, framePayload, conn);
 		}
 		return false;
 	}

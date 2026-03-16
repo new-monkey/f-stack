@@ -1,5 +1,7 @@
 # app/epoll 开发说明
 
+术语规范入口：`TERMINOLOGY.md`
+
 本目录提供 Reactor 组件的基础实现，支持两种后端：
 
 - Kernel 后端：使用 `epoll_*` + `read/write`，用于开发阶段替代测试。
@@ -10,6 +12,7 @@
 - `ReactorServer` 组合 `Acceptor + EventLoop`
 - `EventLoop` 管理 `TcpConnection + MessageDispatcher`
 - `TcpConnection` 持有输入输出 `Buffer`
+- `FrameCodec` 统一处理传输层帧编码/解码
 
 ## 后端切换
 
@@ -45,12 +48,53 @@ g++ -std=c++17 -I/root/f-stack -I/root/f-stack/lib app/epoll/dev_kernel_echo_ser
 
 协议格式：
 
-- Header: `Length(4 bytes, network order) + MsgCode(4 bytes, network order)`
-- Payload: 长度上限 `40960` 字节
+- Frame: `FrameLen(4 bytes, network order) + FramePayload`
+- FramePayload: `MsgCode(4 bytes, network order) + BusinessHeader + MsgBody`
+- `FrameLen = sizeof(FramePayload)`，不包含前 4 字节长度头
+- `sizeof(FramePayload) <= 40960`
+
+`TcpConnection` 在分发时的 `framePayload` 视图定义：
+
+- `framePayload` 从 `MsgCode` 开始，长度为 `FrameLen`
+- 业务层可通过 `FrameCodec::extractMsgCode` 和 `FrameCodec::bodyFromPayload` 继续拆分
+
+统一编解码入口（`FrameCodec.h`）：
+
+- `FrameCodec::encode(msgCode, body)`：将业务 body 编码为 `FrameLen + MsgCode + Body`
+- `FrameCodec::encode(payload)`：当业务层已编码好 `FramePayload`（已包含 `MsgCode`）时直接封帧
+- `FrameCodec::decodeHeader(...)`：解码固定 8 字节头
+- `FrameCodec::isPayloadLenValid(...)`：统一长度合法性校验
+- `FrameCodec::totalFrameBytes(...)`：整帧字节数计算
 
 默认注册：
 
 - `MsgCode == 1`：回显 payload。
+
+## ReactorServer HTML 变体与专用客户端
+
+示例文件：
+
+- 服务端：`dev_reactor_html_server.cpp`
+- 客户端：`dev_reactor_html_client.cpp`
+
+说明：
+
+- 服务端基于 `ReactorServer`，通过回调注入分发处理逻辑，返回 HTML 字符串。
+- 客户端不是通用 HTTP 客户端，而是协议对齐的帧客户端，用于发送/接收 `FrameLen + FramePayload`。
+
+编译：
+
+```bash
+g++ -std=c++17 -I/root/f-stack -I/root/f-stack/lib app/epoll/dev_reactor_html_server.cpp -o /tmp/dev_reactor_html_server
+g++ -std=c++17 -I/root/f-stack -I/root/f-stack/lib app/epoll/dev_reactor_html_client.cpp -o /tmp/dev_reactor_html_client
+```
+
+运行：
+
+```bash
+/tmp/dev_reactor_html_server 19091
+/tmp/dev_reactor_html_client 127.0.0.1 19091 1 "GET /probe"
+```
 
 ## 当前约束
 
@@ -100,3 +144,4 @@ g++ -std=c++17 -I/root/f-stack -I/root/f-stack/lib app/epoll/dev_policy_test.cpp
 
 - Payload 超过 40960 字节会被拒绝并计数。
 - outputBuffer 在 `kDropNewData` 策略下会记录丢弃字节数。
+- dispatcher 接收到的 `payload` 包含 `MsgCode`（即 `FramePayload` 语义）。

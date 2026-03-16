@@ -12,6 +12,7 @@
 #include <sys/epoll.h>
 
 #include "Buffer.h"
+#include "FrameCodec.h"
 #include "MessageDispatcher.h"
 
 class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
@@ -201,8 +202,6 @@ public:
 	}
 
 private:
-	static constexpr std::size_t kHeaderLen = 8;
-	static constexpr std::size_t kFrameHeaderLen = 4;
 
 	bool appendToOutputBuffer(std::string_view data) {
 		if (data.empty()) {
@@ -252,39 +251,37 @@ private:
 		return false;
 	}
 
-	// [PayloadLen:4B][MsgCode:4B][PayloadBody:payloadLenB-4B]
-	// PayloadLen = sizeof(MsgCode) + sizeof(PayloadBody)
-	// Dispatcher payload view = [MsgCode|PayloadBody] (length=PayloadLen)
+	// [FrameLen:4B][FramePayload:FrameLenB]
+	// FramePayload = [MsgCode|BusinessHeader|MsgBody]
+	// Dispatcher framePayload view starts at MsgCode, length = FrameLen.
 	void parseFrames() {
-		while (inputBuffer_.readableBytes() >= kHeaderLen) {
-			const std::string_view header = inputBuffer_.peekAsView(kHeaderLen);
-
-			uint32_t netLen = 0;
-			uint32_t netCode = 0;
-			std::memcpy(&netLen, header.data(), sizeof(netLen));
-			std::memcpy(&netCode, header.data() + sizeof(netLen), sizeof(netCode));
-
-			const uint32_t payloadLen = ntohl(netLen);
-			const uint32_t msgCode = ntohl(netCode);
-
-			if (payloadLen < sizeof(uint32_t) || payloadLen > options_.maxPayloadBytes) {
+		while (inputBuffer_.readableBytes() >= FrameCodec::kHeaderSize) {
+			const std::string_view header = inputBuffer_.peekAsView(FrameCodec::kHeaderSize);
+			FrameCodec::Header decodedHeader;
+			if (!FrameCodec::decodeHeader(header, decodedHeader)) {
 				++stats_.protocolErrors;
-				inputBuffer_.retrieve(kFrameHeaderLen);
+				inputBuffer_.retrieve(FrameCodec::kFrameLenFieldSize);
 				continue;
 			}
 
-			const std::size_t frameLen = kFrameHeaderLen + static_cast<std::size_t>(payloadLen);
-			if (inputBuffer_.readableBytes() < frameLen) {
+			if (!FrameCodec::isFramePayloadLenValid(decodedHeader.framePayloadLen, options_.maxPayloadBytes)) {
+				++stats_.protocolErrors;
+				inputBuffer_.retrieve(FrameCodec::kFrameLenFieldSize);
+				continue;
+			}
+
+			const std::size_t frameBytes = FrameCodec::totalFrameBytes(decodedHeader.framePayloadLen);
+			if (inputBuffer_.readableBytes() < frameBytes) {
 				return;
 			}
 
-			const std::string_view frame = inputBuffer_.peekAsView(frameLen);
-			const std::string_view payload(frame.data() + kFrameHeaderLen, payloadLen);
+			const std::string_view frame = inputBuffer_.peekAsView(frameBytes);
+			const std::string_view framePayload = FrameCodec::payloadFromFrame(frame, decodedHeader.framePayloadLen);
 			if (dispatcher_ != nullptr) {
-				dispatcher_->dispatch(msgCode, payload, shared_from_this());
+				dispatcher_->dispatch(decodedHeader.msgCode, framePayload, shared_from_this());
 			}
 			++stats_.framesDispatched;
-			inputBuffer_.retrieve(frameLen);
+			inputBuffer_.retrieve(frameBytes);
 		}
 	}
 
