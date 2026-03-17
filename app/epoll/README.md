@@ -69,6 +69,8 @@ python3 app/epoll/dev_echo_client.py 127.0.0.1 19090
 - `FrameCodec::isPayloadLenValid(...)`：统一长度合法性校验
 - `FrameCodec::totalFrameBytes(...)`：整帧字节数计算
 
+若业务不是帧协议，而是原始字节流（例如简单 HTTP 示例），可将 `TcpConnection::Options::enableFrameCodec` 设为 `false`，并在连接建立后调用 `setRawMessageCallback(...)` 处理读到的原始数据。
+
 默认注册：
 
 - `MsgCode == 1`：回显 payload。

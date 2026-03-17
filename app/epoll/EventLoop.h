@@ -20,6 +20,8 @@
 
 class EventLoop {
 public:
+	using ConnectionInitializer = std::function<void(const std::shared_ptr<TcpConnection>& conn)>;
+
 	struct Stats {
 		std::size_t totalAccepted = 0;
 		std::size_t totalClosed = 0;
@@ -38,6 +40,7 @@ public:
 		std::size_t maxReadItersPerEvent = 64;
 		std::size_t maxWriteItersPerEvent = 64;
 		TcpConnection::OverflowPolicy overflowPolicy = TcpConnection::OverflowPolicy::kDropNewData;
+		bool enableFrameCodec = true;
 	};
 
 	explicit EventLoop(EpollBackendType backendType)
@@ -63,10 +66,13 @@ public:
 
 	void runInLoop(std::function<void()> fn) { queueInLoop(std::move(fn)); }
 
-	bool addConnection(int fd) {
+	bool addConnection(int fd, ConnectionInitializer initializer = ConnectionInitializer()) {
 		auto conn = std::make_shared<TcpConnection>(fd, buildIoOps(), &dispatcher_, buildConnOptions());
 		conn->setCloseCallback([this](const TcpConnection& connRef) { onConnectionClosed(connRef); });
 		conn->markConnected();
+		if (initializer) {
+			initializer(conn);
+		}
 
 		if (!epoller_.add(fd, conn->interestedEvents(), conn.get())) {
 			return false;
@@ -195,6 +201,7 @@ private:
 		connOptions.maxReadItersPerEvent = options_.maxReadItersPerEvent;
 		connOptions.maxWriteItersPerEvent = options_.maxWriteItersPerEvent;
 		connOptions.overflowPolicy = options_.overflowPolicy;
+		connOptions.enableFrameCodec = options_.enableFrameCodec;
 		return connOptions;
 	}
 

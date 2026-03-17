@@ -49,9 +49,11 @@ public:
 		std::size_t maxReadItersPerEvent = 64;
 		std::size_t maxWriteItersPerEvent = 64;
 		OverflowPolicy overflowPolicy = OverflowPolicy::kDropNewData;
+		bool enableFrameCodec = true;
 	};
 
 	using CloseCallback = std::function<void(const TcpConnection&)>;
+	using RawMessageCallback = std::function<void(std::string_view data, const std::shared_ptr<TcpConnection>& conn)>;
 
 	TcpConnection(int fd, IoOps ioOps, MessageDispatcher* dispatcher)
 		: TcpConnection(fd, std::move(ioOps), dispatcher, Options()) {}
@@ -91,6 +93,8 @@ public:
 	const Stats& stats() const { return stats_; }
 
 	void setCloseCallback(CloseCallback cb) { closeCallback_ = std::move(cb); }
+
+	void setRawMessageCallback(RawMessageCallback cb) { rawMessageCallback_ = std::move(cb); }
 
 	void markConnected() {
 		state_ = State::kConnected;
@@ -155,7 +159,11 @@ public:
 			break;
 		}
 
-		parseFrames();
+		if (options_.enableFrameCodec) {
+			parseFrames();
+		} else {
+			dispatchRawInput();
+		}
 	}
 
 	void handleWriteEvent() {
@@ -295,6 +303,16 @@ private:
 		interestedEvents_ |= static_cast<uint32_t>(EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP);
 	}
 
+	void dispatchRawInput() {
+		if (rawMessageCallback_ == nullptr || inputBuffer_.readableBytes() == 0) {
+			return;
+		}
+
+		const std::string_view data = inputBuffer_.peekAsView(inputBuffer_.readableBytes());
+		rawMessageCallback_(data, shared_from_this());
+		inputBuffer_.retrieveAll();
+	}
+
 private:
 	int fd_;
 	IoOps ioOps_;
@@ -307,4 +325,5 @@ private:
 	Stats stats_;
 	bool closeNotified_;
 	CloseCallback closeCallback_;
+	RawMessageCallback rawMessageCallback_;
 };
