@@ -40,7 +40,7 @@ void onSignal(int) {
 bool writeAllNonBlocking(int fd, const char* data, std::size_t len) {
     std::size_t sent = 0;
     while (sent < len) {
-        const ssize_t n = ::write(fd, data + sent, len - sent);
+        const ssize_t n = ff_write(fd, data + sent, len - sent);
         if (n > 0) {
             sent += static_cast<std::size_t>(n);
             continue;
@@ -97,7 +97,7 @@ void runOnce(Epoller& epoller, Acceptor& acceptor, std::unordered_set<int>& clie
 
             if (ev.events & static_cast<uint32_t>(EPOLLIN)) {
                 char buf[1024];
-                const ssize_t n = ::read(fd, buf, sizeof(buf));
+                const ssize_t n = ff_read(fd, buf, sizeof(buf));
                 if (n > 0) {
                     if (!writeAllNonBlocking(fd, kHtml, sizeof(kHtml) - 1)) {
                         std::cerr << "write to fd " << fd << " would block, closing connection" << std::endl;
@@ -140,13 +140,6 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
 
-    EventLoop::Options options;
-    options.maxPayloadBytes = 40960;
-    options.maxOutputBufferBytes = 1U << 20;
-    options.overflowPolicy = TcpConnection::OverflowPolicy::kDropNewData;
-
-    EventLoop loop(EpollBackendType::kFStack, options);
-
     Epoller epoller(EpollBackendType::kFStack, kMaxEvents);
     if (!epoller.open()) {
         std::perror("epoller.open");
@@ -161,16 +154,13 @@ int main(int argc, char** argv) {
 
     std::unordered_set<int> clients;
     acceptor.setNewConnectionCallback([&](int clientFd) {
-        
-        auto conn = std::make_shared<TcpConnection>(clientFd, nullptr, nullptr);
-
-        
         const uint32_t ev = static_cast<uint32_t>(EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP);
         if (!epoller.add(clientFd, ev)) {
             (void)::close(clientFd);
             return;
         }
         clients.insert(clientFd);
+
     });
 
     if (!epoller.add(acceptor.fd(), static_cast<uint32_t>(EPOLLIN))) {
