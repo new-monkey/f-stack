@@ -81,6 +81,17 @@
 #include <ifaddrs.h>            /* getifaddrs / freeifaddrs                */
 #include <arpa/inet.h>          /* inet_aton / inet_ntoa                   */
 
+/*
+ * MSG_NOSIGNAL is a glibc extension exposed only when _GNU_SOURCE or
+ * _BSD_SOURCE is defined.  The FreeBSD compat headers use __BSD_VISIBLE
+ * (a no-op for glibc), so the symbol may be hidden.  Define a fallback
+ * of 0: ff_netd already calls signal(SIGPIPE, SIG_IGN) in main(), so
+ * suppressing the flag has no practical effect.
+ */
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 /* -----------------------------------------------------------------------
  * DPDK & F-Stack IPC
  * ---------------------------------------------------------------------- */
