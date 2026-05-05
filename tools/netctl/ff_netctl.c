@@ -177,19 +177,18 @@ main(int argc, char *argv[])
     }
 
     if (strncmp(resp, "+OK\n", 4) == 0) {
-        /* Print everything after the "+OK\n" status line */
+        /* Multi-line success: print everything after the "+OK\n" header */
         const char *content = resp + 4;
         if (*content)
             printf("%s", content);
-    } else if (strncmp(resp, "+OK", 3) == 0) {
-        /* Single-line success without body – print from "+OK " onward */
-        const char *msg = resp + 4;   /* skip "+OK " */
+    } else if (strncmp(resp, "+OK ", 4) == 0) {
+        /* Single-line success: print message after "+OK " */
+        const char *msg = resp + 4;
         if (*msg)
             printf("%s", msg);
-    } else if (strncmp(resp, "-ERR", 4) == 0) {
-        /* Print error to stderr, strip "-ERR " prefix */
-        const char *msg = resp + 5;
-        fprintf(stderr, "Error: %s", *msg ? msg : "(unknown)\n");
+    } else if (strncmp(resp, "-ERR ", 5) == 0) {
+        /* Error: print message after "-ERR " to stderr */
+        fprintf(stderr, "Error: %s", resp + 5);
         ret = 1;
     } else {
         /* Unexpected format – print as-is */

@@ -234,10 +234,13 @@ cmd_addr_show(const char *ifname, char *out, size_t outlen)
 
             char ip_s[INET_ADDRSTRLEN];
             char nm_s[INET_ADDRSTRLEN];
-            strncpy(ip_s, inet_ntoa(sin->sin_addr),  sizeof(ip_s));
-            strncpy(nm_s,
-                    mask ? inet_ntoa(mask->sin_addr) : "0.0.0.0",
-                    sizeof(nm_s));
+            /* Use inet_ntop to avoid clobbering the static buffer that
+             * inet_ntoa reuses across consecutive calls. */
+            inet_ntop(AF_INET, &sin->sin_addr, ip_s, sizeof(ip_s));
+            if (mask)
+                inet_ntop(AF_INET, &mask->sin_addr, nm_s, sizeof(nm_s));
+            else
+                strncpy(nm_s, "0.0.0.0", sizeof(nm_s));
 
             pos += snprintf(out + pos, outlen - pos,
                 "  inet %-15s netmask %s", ip_s, nm_s);
@@ -251,6 +254,7 @@ cmd_addr_show(const char *ifname, char *out, size_t outlen)
             pos += snprintf(out + pos, outlen - pos, "\n");
         }
 
+        /* Safety margin: stop when the buffer is nearly full */
         if (pos >= outlen - 128)
             break;
     }
@@ -431,7 +435,10 @@ cmd_route_show(char *out, size_t outlen)
         if (gw_sa) {
             if (gw_sa->sa_family == AF_INET) {
                 struct sockaddr_in *gw = (struct sockaddr_in *)gw_sa;
-                strncpy(gw_buf, inet_ntoa(gw->sin_addr), sizeof(gw_buf) - 1);
+                /* inet_ntop avoids the static-buffer issue of inet_ntoa */
+                inet_ntop(AF_INET, &gw->sin_addr,
+                          gw_buf, (socklen_t)sizeof(gw_buf));
+                gw_buf[sizeof(gw_buf) - 1] = '\0';
             } else if (gw_sa->sa_family == AF_LINK) {
                 struct sockaddr_dl *sdl = (struct sockaddr_dl *)gw_sa;
                 if (sdl->sdl_nlen > 0) {
@@ -456,7 +463,7 @@ cmd_route_show(char *out, size_t outlen)
         pos += snprintf(out + pos, outlen - pos,
             "%-20s %-18s %s\n", dst_buf, gw_buf, flags);
 
-        if (pos >= outlen - 128)
+        if (pos >= outlen - 128) /* safety margin: stop when nearly full */
             break;
     }
 
@@ -503,7 +510,10 @@ cmd_route_add(const char *dest, int prefix, const char *gw,
 
     msg.mask.sin_family = AF_INET;
     msg.mask.sin_len    = sizeof(struct sockaddr_in);
-    if (prefix > 0)
+    /* prefix 1-32: compute mask; prefix 0 (default route): mask stays 0.0.0.0.
+     * The shift `1u << (32 - prefix)` is well-defined for prefix in [1, 32]
+     * because `32 - prefix` is in [0, 31]. */
+    if (prefix > 0 && prefix <= 32)
         msg.mask.sin_addr.s_addr =
             htonl(~((1u << (32 - prefix)) - 1));
     /* prefix == 0 → default route, mask stays 0.0.0.0 */
@@ -542,7 +552,8 @@ cmd_route_del(const char *dest, int prefix, char *errbuf, size_t errsz)
 
     msg.mask.sin_family = AF_INET;
     msg.mask.sin_len    = sizeof(struct sockaddr_in);
-    if (prefix > 0)
+    /* Same shift-range guarantee as cmd_route_add */
+    if (prefix > 0 && prefix <= 32)
         msg.mask.sin_addr.s_addr =
             htonl(~((1u << (32 - prefix)) - 1));
 
@@ -569,9 +580,11 @@ parse_cidr(const char *cidr, char *dest, size_t destsz, int *prefix)
             return -1;
         memcpy(dest, cidr, n);
         dest[n] = '\0';
-        *prefix = atoi(slash + 1);
-        if (*prefix < 0 || *prefix > 32)
+        char *end;
+        long pval = strtol(slash + 1, &end, 10);
+        if (end == slash + 1 || *end != '\0' || pval < 0 || pval > 32)
             return -1;
+        *prefix = (int)pval;
     } else {
         strncpy(dest, cidr, destsz - 1);
         dest[destsz - 1] = '\0';

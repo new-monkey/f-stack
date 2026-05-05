@@ -78,7 +78,7 @@ ff_netctl [-s socket] <command> [args ...]
 | `addr add <ifname> <ip> <netmask>` | Add an IPv4 address |
 | `addr del <ifname> <ip>` | Remove an IPv4 address |
 | `link show [<ifname>]` | Show link status |
-| `link set <ifname> up\|down` | Bring an interface up or down |
+| `link set <ifname> up|down` | Bring an interface up or down |
 | `route show` | Show IPv4 routing table |
 | `route add <dest/prefix> [gw] <gateway>` | Add a static route |
 | `route del <dest/prefix>` | Delete a route |
