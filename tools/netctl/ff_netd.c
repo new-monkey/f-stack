@@ -240,7 +240,7 @@ cmd_addr_show(const char *ifname, char *out, size_t outlen)
             if (mask)
                 inet_ntop(AF_INET, &mask->sin_addr, nm_s, sizeof(nm_s));
             else
-                strncpy(nm_s, "0.0.0.0", sizeof(nm_s));
+                snprintf(nm_s, sizeof(nm_s), "0.0.0.0");
 
             pos += snprintf(out + pos, outlen - pos,
                 "  inet %-15s netmask %s", ip_s, nm_s);
@@ -248,8 +248,10 @@ cmd_addr_show(const char *ifname, char *out, size_t outlen)
             if (ifa->ifa_broadaddr) {
                 struct sockaddr_in *brd =
                     (struct sockaddr_in *)ifa->ifa_broadaddr;
+                char brd_s[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &brd->sin_addr, brd_s, sizeof(brd_s));
                 pos += snprintf(out + pos, outlen - pos,
-                    " broadcast %s", inet_ntoa(brd->sin_addr));
+                    " broadcast %s", brd_s);
             }
             pos += snprintf(out + pos, outlen - pos, "\n");
         }
@@ -422,12 +424,13 @@ cmd_route_show(char *out, size_t outlen)
             snprintf(dst_buf, sizeof(dst_buf), "default");
         } else {
             int prefix = 0;
+            char addr_s[INET_ADDRSTRLEN];
             if (mask) {
                 uint32_t m = ntohl(mask->sin_addr.s_addr);
                 while (m & 0x80000000u) { prefix++; m <<= 1; }
             }
-            snprintf(dst_buf, sizeof(dst_buf), "%s/%d",
-                     inet_ntoa(dst->sin_addr), prefix);
+            inet_ntop(AF_INET, &dst->sin_addr, addr_s, sizeof(addr_s));
+            snprintf(dst_buf, sizeof(dst_buf), "%s/%d", addr_s, prefix);
         }
 
         /* Gateway string */
@@ -453,12 +456,14 @@ cmd_route_show(char *out, size_t outlen)
             }
         }
 
-        /* Flags string */
-        char flags[16] = "";
-        if (rtm->rtm_flags & RTF_UP)      strcat(flags, "U");
-        if (rtm->rtm_flags & RTF_GATEWAY) strcat(flags, "G");
-        if (rtm->rtm_flags & RTF_HOST)    strcat(flags, "H");
-        if (rtm->rtm_flags & RTF_STATIC)  strcat(flags, "S");
+        /* Flags string: build with bounds-checked character appends */
+        char flags[8] = "";
+        size_t flen = 0;
+        if (rtm->rtm_flags & RTF_UP      && flen < sizeof(flags)-1) flags[flen++] = 'U';
+        if (rtm->rtm_flags & RTF_GATEWAY && flen < sizeof(flags)-1) flags[flen++] = 'G';
+        if (rtm->rtm_flags & RTF_HOST    && flen < sizeof(flags)-1) flags[flen++] = 'H';
+        if (rtm->rtm_flags & RTF_STATIC  && flen < sizeof(flags)-1) flags[flen++] = 'S';
+        flags[flen] = '\0';
 
         pos += snprintf(out + pos, outlen - pos,
             "%-20s %-18s %s\n", dst_buf, gw_buf, flags);
@@ -833,7 +838,10 @@ server_init(const char *path)
 {
     struct unix_addr addr;
 
-    unlink(path);   /* remove stale socket file */
+    /* Remove stale socket file from a previous run */
+    if (unlink(path) < 0 && errno != ENOENT)
+        fprintf(stderr, "ff_netd: warning: unlink(%s): %s\n",
+                path, strerror(errno));
 
     /*
      * socket() resolves to the real Linux syscall via glibc; AF_UNIX=1

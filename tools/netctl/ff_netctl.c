@@ -99,14 +99,25 @@ main(int argc, char *argv[])
     /* ------------------------------------------------------------------
      * Build the command string from the remaining arguments.
      * ------------------------------------------------------------------ */
-    char cmd[512] = "";
+    char   cmd[512] = "";
+    size_t cmd_len  = 0;
     for (int i = arg_start; i < argc; i++) {
-        if (i > arg_start)
-            strncat(cmd, " ", sizeof(cmd) - strlen(cmd) - 1);
-        strncat(cmd, argv[i], sizeof(cmd) - strlen(cmd) - 1);
+        if (i > arg_start && cmd_len < sizeof(cmd) - 2) {
+            cmd[cmd_len++] = ' ';
+            cmd[cmd_len]   = '\0';
+        }
+        size_t avail = sizeof(cmd) - cmd_len - 1;
+        size_t slen  = strlen(argv[i]);
+        if (slen > avail)
+            slen = avail;
+        memcpy(cmd + cmd_len, argv[i], slen);
+        cmd_len += slen;
+        cmd[cmd_len] = '\0';
     }
     /* Append newline so ff_netd can detect end-of-line */
-    strncat(cmd, "\n", sizeof(cmd) - strlen(cmd) - 1);
+    if (cmd_len < sizeof(cmd) - 1)
+        cmd[cmd_len++] = '\n';
+    cmd[cmd_len] = '\0';
 
     /* ------------------------------------------------------------------
      * Connect to ff_netd.
