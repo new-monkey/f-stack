@@ -25,7 +25,7 @@
  */
 
 /*
- * ff_netctl – F-Stack Network Configuration CLI Client
+ * ff_netctl - F-Stack Network Configuration CLI Client
  *
  * A pure Linux utility (no DPDK, no FreeBSD compat headers) that connects to
  * ff_netd via a Unix domain socket, sends a command string, and prints the

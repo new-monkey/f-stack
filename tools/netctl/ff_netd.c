@@ -25,7 +25,7 @@
  */
 
 /*
- * ff_netd – F-Stack Network Configuration Daemon
+ * ff_netd - F-Stack Network Configuration Daemon
  *
  * Runs as a DPDK secondary process. Listens on a Unix domain socket and
  * forwards network-configuration requests to every F-Stack worker process via
@@ -438,7 +438,6 @@ cmd_route_show(char *out, size_t outlen)
         if (gw_sa) {
             if (gw_sa->sa_family == AF_INET) {
                 struct sockaddr_in *gw = (struct sockaddr_in *)gw_sa;
-                /* inet_ntop avoids the static-buffer issue of inet_ntoa */
                 inet_ntop(AF_INET, &gw->sin_addr,
                           gw_buf, (socklen_t)sizeof(gw_buf));
                 gw_buf[sizeof(gw_buf) - 1] = '\0';
@@ -515,13 +514,15 @@ cmd_route_add(const char *dest, int prefix, const char *gw,
 
     msg.mask.sin_family = AF_INET;
     msg.mask.sin_len    = sizeof(struct sockaddr_in);
-    /* prefix 1-32: compute mask; prefix 0 (default route): mask stays 0.0.0.0.
-     * The shift `1u << (32 - prefix)` is well-defined for prefix in [1, 32]
-     * because `32 - prefix` is in [0, 31]. */
+    /*
+     * Build the subnet mask from the prefix length.
+     * prefix 0  -> default route: mask stays 0.0.0.0 (skipped below).
+     * prefix 1-32: the shift `1u << (32 - prefix)` has `32 - prefix`
+     * in [0, 31], which is well-defined in C.
+     */
     if (prefix > 0 && prefix <= 32)
         msg.mask.sin_addr.s_addr =
             htonl(~((1u << (32 - prefix)) - 1));
-    /* prefix == 0 → default route, mask stays 0.0.0.0 */
 
     return broadcast_rtmsg(&msg, sizeof(msg), errbuf, errsz);
 }
